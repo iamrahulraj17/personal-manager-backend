@@ -1,6 +1,10 @@
 
 const db = require('../../config/database');
 
+// --------------------------------------------------
+// PROFILE
+// --------------------------------------------------
+
 async function getProfile(userId) {
     const [rows] = await db.execute(
         `SELECT
@@ -61,7 +65,6 @@ async function updateProfile(userId, data) {
     );
 
     if (result.affectedRows === 0) {
-        // Confirm whether the profile exists.
         const [rows] = await db.execute(
             'SELECT user_id FROM user_profiles WHERE user_id = ?',
             [userId]
@@ -76,6 +79,10 @@ async function updateProfile(userId, data) {
 
     return getProfile(userId);
 }
+
+// --------------------------------------------------
+// APPLICATION PREFERENCES
+// --------------------------------------------------
 
 async function getPreferences(userId) {
     const [rows] = await db.execute(
@@ -116,8 +123,6 @@ async function updatePreferences(userId, data) {
     try {
         await connection.beginTransaction();
 
-        // Verify that the selected default module is active
-        // and enabled for this user.
         if (default_landing_module_id !== undefined) {
             const [modules] = await connection.execute(
                 `SELECT m.id
@@ -188,9 +193,236 @@ async function updatePreferences(userId, data) {
     }
 }
 
+// --------------------------------------------------
+// MODULE MANAGEMENT
+// --------------------------------------------------
+
+async function getModules(userId) {
+    const [moduleRows] = await db.execute(
+        `SELECT
+            m.id,
+            m.module_key,
+            m.module_name,
+            m.description,
+            m.icon,
+            m.route_path,
+            m.is_system,
+            m.is_active,
+            COALESCE(ump.is_enabled, 1) AS is_enabled,
+            COALESCE(ump.display_order, m.default_order) AS display_order
+         FROM modules m
+         LEFT JOIN user_module_preferences ump
+            ON ump.module_id = m.id
+            AND ump.user_id = ?
+         WHERE m.is_active = 1
+         ORDER BY display_order ASC, m.id ASC`,
+        [userId]
+    );
+
+    const [submoduleRows] = await db.execute(
+        `SELECT
+            s.id,
+            s.module_id,
+            s.submodule_key,
+            s.submodule_name,
+            s.description,
+            s.icon,
+            s.route_path,
+            s.is_active,
+            COALESCE(usp.is_enabled, 1) AS is_enabled,
+            COALESCE(usp.display_order, s.default_order) AS display_order
+         FROM submodules s
+         INNER JOIN modules m ON m.id = s.module_id
+         LEFT JOIN user_submodule_preferences usp
+            ON usp.submodule_id = s.id
+            AND usp.user_id = ?
+         WHERE s.is_active = 1
+           AND m.is_active = 1
+         ORDER BY s.module_id ASC, display_order ASC, s.id ASC`,
+        [userId]
+    );
+
+    return moduleRows.map(module => {
+        const isSystem = Boolean(module.is_system);
+        const isEnabled = isSystem || Boolean(module.is_enabled);
+
+        return {
+            id: module.id,
+            module_key: module.module_key,
+            module_name: module.module_name,
+            description: module.description,
+            icon: module.icon,
+            route_path: module.route_path,
+            is_system: isSystem,
+            is_enabled: isEnabled,
+            display_order: module.display_order,
+            submodules: submoduleRows
+                .filter(submodule => submodule.module_id === module.id)
+                .map(submodule => ({
+                    id: submodule.id,
+                    submodule_key: submodule.submodule_key,
+                    submodule_name: submodule.submodule_name,
+                    description: submodule.description,
+                    icon: submodule.icon,
+                    route_path: submodule.route_path,
+                    is_enabled: isEnabled && Boolean(submodule.is_enabled),
+                    display_order: submodule.display_order
+                }))
+        };
+    });
+}
+
+async function updateModules(userId, modules) {
+    const connection = await db.getConnection();
+
+    try {
+        await connection.beginTransaction();
+
+        // Fetch active modules from the database.
+        const [databaseModules] = await connection.execute(
+            `SELECT id, module_key, is_system
+             FROM modules
+             WHERE is_active = 1`
+        );
+
+        const moduleMap = new Map(
+            databaseModules.map(module => [module.module_key, module])
+        );
+
+        const submittedKeys = new Set();
+
+        for (const item of modules) {
+            if (submittedKeys.has(item.module_key)) {
+                const error = new Error('Duplicate module key: ' + item.module_key);
+                error.statusCode = 400;
+                throw error;
+            }
+
+            submittedKeys.add(item.module_key);
+
+            const databaseModule = moduleMap.get(item.module_key);
+
+            if (!databaseModule) {
+                const error = new Error('Invalid or inactive module: ' + item.module_key);
+                error.statusCode = 400;
+                throw error;
+            }
+
+            if (databaseModule.is_system && !item.is_enabled) {
+                const error = new Error('System modules cannot be disabled');
+                error.statusCode = 400;
+                throw error;
+            }
+
+            const moduleEnabled =
+                Boolean(databaseModule.is_system) || item.is_enabled;
+
+            await connection.execute(
+                `INSERT INTO user_module_preferences
+                    (user_id, module_id, is_enabled, display_order)
+                 VALUES (?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE
+                    is_enabled = VALUES(is_enabled),
+                    display_order = VALUES(display_order)`,
+                [
+                    userId,
+                    databaseModule.id,
+                    moduleEnabled ? 1 : 0,
+                    item.display_order
+                ]
+            );
+
+            // Validate submitted submodules belong to this module.
+            const [databaseSubmodules] = await connection.execute(
+                `SELECT id, submodule_key
+                 FROM submodules
+                 WHERE module_id = ?
+                   AND is_active = 1`,
+                [databaseModule.id]
+            );
+
+            const submoduleMap = new Map(
+                databaseSubmodules.map(submodule => [
+                    submodule.submodule_key,
+                    submodule
+                ])
+            );
+
+            const submittedSubmoduleKeys = new Set();
+
+            for (const submodule of item.submodules) {
+                if (submittedSubmoduleKeys.has(submodule.submodule_key)) {
+                    const error = new Error(
+                        'Duplicate submodule key: ' + submodule.submodule_key
+                    );
+                    error.statusCode = 400;
+                    throw error;
+                }
+
+                submittedSubmoduleKeys.add(submodule.submodule_key);
+
+                const databaseSubmodule = submoduleMap.get(
+                    submodule.submodule_key
+                );
+
+                if (!databaseSubmodule) {
+                    const error = new Error(
+                        'Invalid submodule: ' + submodule.submodule_key
+                    );
+                    error.statusCode = 400;
+                    throw error;
+                }
+
+                const submoduleEnabled =
+                    moduleEnabled && submodule.is_enabled;
+
+                await connection.execute(
+                    `INSERT INTO user_submodule_preferences
+                        (user_id, module_id, submodule_id, is_enabled, display_order)
+                     VALUES (?, ?, ?, ?, ?)
+                     ON DUPLICATE KEY UPDATE
+                        is_enabled = VALUES(is_enabled),
+                        display_order = VALUES(display_order)`,
+                    [
+                        userId,
+                        databaseModule.id,
+                        databaseSubmodule.id,
+                        submoduleEnabled ? 1 : 0,
+                        submodule.display_order
+                    ]
+                );
+            }
+
+            // If the parent is disabled, disable every submodule,
+            // including any not included in the request.
+            if (!moduleEnabled) {
+                await connection.execute(
+                    `UPDATE user_submodule_preferences
+                     SET is_enabled = 0
+                     WHERE user_id = ?
+                       AND module_id = ?`,
+                    [userId, databaseModule.id]
+                );
+            }
+        }
+
+        await connection.commit();
+
+        return getModules(userId);
+
+    } catch (error) {
+        await connection.rollback();
+        throw error;
+    } finally {
+        connection.release();
+    }
+}
+
 module.exports = {
     getProfile,
     updateProfile,
     getPreferences,
-    updatePreferences
+    updatePreferences,
+    getModules,
+    updateModules
 };
