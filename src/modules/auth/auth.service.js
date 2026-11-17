@@ -1,3 +1,4 @@
+
 const argon2 = require('argon2');
 const db = require('../../config/database');
 const jwt = require('jsonwebtoken');
@@ -5,11 +6,12 @@ const crypto = require('crypto');
 
 async function signupUser({ full_name, email, password }) {
     const connection = await db.getConnection();
+    let transactionStarted = false;
 
     try {
         await connection.beginTransaction();
+        transactionStarted = true;
 
-        // Check whether email already exists
         const [existingUsers] = await connection.execute(
             'SELECT id FROM users WHERE email = ? LIMIT 1',
             [email]
@@ -21,12 +23,10 @@ async function signupUser({ full_name, email, password }) {
             throw error;
         }
 
-        // Hash account password using Argon2id
         const passwordHash = await argon2.hash(password, {
             type: argon2.argon2id
         });
 
-        // Create user (email remains unverified for now)
         const [userResult] = await connection.execute(
             `INSERT INTO users
              (email, password_hash, email_verified, account_status)
@@ -36,14 +36,12 @@ async function signupUser({ full_name, email, password }) {
 
         const userId = userResult.insertId;
 
-        // Create user profile
         await connection.execute(
             `INSERT INTO user_profiles (user_id, full_name)
              VALUES (?, ?)`,
             [userId, full_name]
         );
 
-        // Fetch active modules
         const [modules] = await connection.execute(
             `SELECT id, module_key, default_order
              FROM modules
@@ -59,7 +57,6 @@ async function signupUser({ full_name, email, password }) {
             throw new Error('Password Manager module is not configured');
         }
 
-        // Create default user preferences
         await connection.execute(
             `INSERT INTO user_preferences
              (user_id, default_landing_module_id, theme)
@@ -67,7 +64,6 @@ async function signupUser({ full_name, email, password }) {
             [userId, passwordModule.id]
         );
 
-        // Fetch active submodules
         const [submodules] = await connection.execute(
             `SELECT id, module_id, default_order
              FROM submodules
@@ -75,7 +71,6 @@ async function signupUser({ full_name, email, password }) {
              ORDER BY default_order`
         );
 
-        // Enable modules and submodules by default
         for (const module of modules) {
             await connection.execute(
                 `INSERT INTO user_module_preferences
@@ -100,6 +95,7 @@ async function signupUser({ full_name, email, password }) {
         }
 
         await connection.commit();
+        transactionStarted = false;
 
         return {
             userId,
@@ -109,17 +105,28 @@ async function signupUser({ full_name, email, password }) {
         };
 
     } catch (error) {
-        await connection.rollback();
+        if (transactionStarted) {
+            await connection.rollback();
+        }
         throw error;
+
     } finally {
         connection.release();
     }
 }
 
-async function loginUser({ email, password, device_name, ip_address, user_agent }) {
+async function loginUser({
+    email,
+    password,
+    device_name,
+    ip_address,
+    user_agent
+}) {
     const connection = await db.getConnection();
+    let transactionStarted = false;
 
     try {
+        // 1. Find user
         const [users] = await connection.execute(
             `SELECT id, email, password_hash, account_status
              FROM users
@@ -136,12 +143,14 @@ async function loginUser({ email, password, device_name, ip_address, user_agent 
 
         const user = users[0];
 
+        // 2. Check account status
         if (user.account_status !== 'active') {
             const error = new Error('Your account is not active');
             error.statusCode = 403;
             throw error;
         }
 
+        // 3. Verify account password
         const passwordMatches = await argon2.verify(
             user.password_hash,
             password
@@ -153,53 +162,32 @@ async function loginUser({ email, password, device_name, ip_address, user_agent 
             throw error;
         }
 
-        const [sessionResult] = await connection.execute(
-            `INSERT INTO user_sessions
-            (user_id, refresh_token_hash, device_name, ip_address,
-            user_agent, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?)`,
-            [
-                user.id,
-                refreshTokenHash,
-                device_name || 'Unknown Device',
-                ip_address || null,
-                user_agent || null,
-                mysqlDate
-            ]
-        );
-
-        const accessToken = jwt.sign(
-            {
-                userId: user.id,
-                email: user.email,
-                sessionId: sessionResult.insertId
-            },
-            process.env.JWT_ACCESS_SECRET,
-            {
-                expiresIn: process.env.JWT_ACCESS_EXPIRY || '15m'
-            }
-        );
-
-        // Generate an opaque refresh token
+        // 4. Generate refresh token
         const refreshToken = crypto.randomBytes(64).toString('hex');
 
-        // Store only its SHA-256 hash
+        // 5. Hash refresh token before storing it
         const refreshTokenHash = crypto
             .createHash('sha256')
             .update(refreshToken)
             .digest('hex');
 
+        // 6. Calculate session expiry
         const refreshDays = Number(process.env.JWT_REFRESH_DAYS) || 7;
 
         const expiresAt = new Date(
             Date.now() + refreshDays * 24 * 60 * 60 * 1000
         );
 
-        const mysqlDate = expiresAt.toISOString().slice(0, 19).replace('T', ' ');
+        const mysqlDate = expiresAt
+            .toISOString()
+            .slice(0, 19)
+            .replace('T', ' ');
 
+        // 7. Create session inside a transaction
         await connection.beginTransaction();
+        transactionStarted = true;
 
-        await connection.execute(
+        const [sessionResult] = await connection.execute(
             `INSERT INTO user_sessions
              (user_id, refresh_token_hash, device_name, ip_address,
               user_agent, expires_at)
@@ -214,13 +202,29 @@ async function loginUser({ email, password, device_name, ip_address, user_agent 
             ]
         );
 
+        // 8. Generate access token linked to this session
+        const accessToken = jwt.sign(
+            {
+                userId: user.id,
+                email: user.email,
+                sessionId: sessionResult.insertId
+            },
+            process.env.JWT_ACCESS_SECRET,
+            {
+                expiresIn: process.env.JWT_ACCESS_EXPIRY || '15m'
+            }
+        );
+
+        // 9. Update last login time
         await connection.execute(
             'UPDATE users SET last_login_at = NOW() WHERE id = ?',
             [user.id]
         );
 
         await connection.commit();
+        transactionStarted = false;
 
+        // 10. Return tokens and user information
         return {
             user: {
                 id: user.id,
@@ -232,8 +236,11 @@ async function loginUser({ email, password, device_name, ip_address, user_agent 
         };
 
     } catch (error) {
-        await connection.rollback();
+        if (transactionStarted) {
+            await connection.rollback();
+        }
         throw error;
+
     } finally {
         connection.release();
     }
@@ -264,9 +271,11 @@ async function refreshUserSession(refreshToken) {
     }
 
     const connection = await db.getConnection();
+    let transactionStarted = false;
 
     try {
         await connection.beginTransaction();
+        transactionStarted = true;
 
         const oldHash = crypto
             .createHash('sha256')
@@ -326,10 +335,10 @@ async function refreshUserSession(refreshToken) {
             [newRefreshTokenHash, mysqlDate, user.session_id]
         );
 
-        // The new access token is linked to the existing session.
         const accessToken = createAccessToken(user);
 
         await connection.commit();
+        transactionStarted = false;
 
         return {
             accessToken,
@@ -338,8 +347,11 @@ async function refreshUserSession(refreshToken) {
         };
 
     } catch (error) {
-        await connection.rollback();
+        if (transactionStarted) {
+            await connection.rollback();
+        }
         throw error;
+
     } finally {
         connection.release();
     }
@@ -377,4 +389,9 @@ async function logoutUser(refreshToken) {
     return true;
 }
 
-module.exports = { signupUser, loginUser, refreshUserSession, logoutUser };
+module.exports = {
+    signupUser,
+    loginUser,
+    refreshUserSession,
+    logoutUser
+};
